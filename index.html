@@ -224,6 +224,8 @@
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
   </div>
   
   <div class="info-box">
@@ -244,14 +246,17 @@ const API_KEY = "d7ulle9r01qnv95o2khgd7ulle9r01qnv95o2ki0";
 
 
 // 알파벳 순서로 정렬 (티커 기준)
+// market: 'us'(미국, Finnhub) 또는 'kr'(한국, 네이버금융)
 const STOCKS = [
-  { ticker: 'COIN',  name: 'Coinbase',  desc: '크립토 거래소',  category: '코인' },
-  { ticker: 'CRCL',  name: 'Circle',    desc: 'USDC 발행사',    category: '코인' },
-  { ticker: 'GOOGL', name: 'Alphabet',  desc: '구글 모회사',    category: 'AI' },
-  { ticker: 'IONQ',  name: 'IonQ',      desc: '양자컴퓨팅',     category: 'AI' },
-  { ticker: 'NVDA',  name: 'NVIDIA',    desc: 'AI 반도체',      category: 'AI' },
-  { ticker: 'PLTR',  name: 'Palantir',  desc: 'AI/빅데이터',    category: 'AI' },
-  { ticker: 'TSLA',  name: 'Tesla',     desc: '전기차/AI',      category: 'AI' }
+  { ticker: 'COIN',   name: 'Coinbase',     desc: '크립토 거래소',  category: '코인', market: 'us' },
+  { ticker: 'CRCL',   name: 'Circle',       desc: 'USDC 발행사',    category: '코인', market: 'us' },
+  { ticker: 'GOOGL',  name: 'Alphabet',     desc: '구글 모회사',    category: 'AI',   market: 'us' },
+  { ticker: 'IONQ',   name: 'IonQ',         desc: '양자컴퓨팅',     category: 'AI',   market: 'us' },
+  { ticker: 'NVDA',   name: 'NVIDIA',       desc: 'AI 반도체',      category: 'AI',   market: 'us' },
+  { ticker: 'MU',     name: 'Micron',       desc: 'AI 메모리/HBM',  category: 'AI',   market: 'us' },
+  { ticker: 'PLTR',   name: 'Palantir',     desc: 'AI/빅데이터',    category: 'AI',   market: 'us' },
+  { ticker: 'TSLA',   name: 'Tesla',        desc: '전기차/AI',      category: 'AI',   market: 'us' },
+  { ticker: '376900', name: '로킷헬스케어', desc: '재생치료 의료기기', category: '헬스케어', market: 'kr' }
 ];
 
 const CACHE_KEY = 'stock_tracker_cache_v6';
@@ -312,9 +317,100 @@ const KNOWN_ATH = {
   'GOOGL': 399.01,    // 2026-05-05
   'IONQ':  84.64,
   'NVDA':  216.83,    // 2026-04-27
+  'MU':    956.16,    // 2026-05 52주최고(사실상 ATH), Finnhub가 자동 갱신
   'PLTR':  207.50,    // 2025-11
-  'TSLA':  498.83     // 2025-12-22
+  'TSLA':  498.83,    // 2025-12-22
+  '376900': 0         // 로킷헬스케어 - 네이버 52주 고점으로 자동
 };
+
+// 한국 주식용 CORS 프록시 (네이버 금융은 CORS 막혀있어서 필요)
+const KR_PROXIES = [
+  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`
+];
+
+async function krProxyFetch(targetUrl) {
+  const promises = KR_PROXIES.map(p =>
+    fetch(p(targetUrl), { cache: 'no-store' }).then(async r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const text = await r.text();
+      return JSON.parse(text);
+    })
+  );
+  return await Promise.any(promises);
+}
+
+// 한국 주식 현재가 + 52주 고점 (네이버 금융)
+async function fetchKrStock(code) {
+  const url = `https://m.stock.naver.com/api/stock/${code}/integration`;
+  const data = await krProxyFetch(url);
+
+  const num = (v) => {
+    if (v == null) return null;
+    const n = parseFloat(String(v).replace(/,/g, ''));
+    return isNaN(n) ? null : n;
+  };
+
+  const totalInfos = data.totalInfos || [];
+  const findVal = (codeKey) => {
+    const item = totalInfos.find(t => t.code === codeKey);
+    return item ? num(item.value) : null;
+  };
+
+  let currentPrice = num(data.closePrice)
+    || findVal('closePrice')
+    || (data.dealTrendInfos && data.dealTrendInfos[0] && num(data.dealTrendInfos[0].closePrice));
+
+  let prevClose = num(data.previousClose)
+    || findVal('previousClose')
+    || findVal('basePrice')
+    || num(data.basePrice);
+
+  let high52 = findVal('highPriceOf52Weeks')
+    || num(data.highPriceOf52Weeks);
+
+  if (currentPrice == null) throw new Error('가격 파싱 실패');
+
+  return {
+    currentPrice,
+    prevClose: prevClose || currentPrice,
+    high52: high52 || currentPrice
+  };
+}
+
+async function fetchStockSmartKr(stock) {
+  const code = stock.ticker;
+  const athCache = getCache(ATH_CACHE_KEY) || {};
+  const now = Date.now();
+
+  try {
+    const kr = await fetchKrStock(code);
+
+    let ath;
+    if (athCache[code] && (now - athCache[code].timestamp) < ATH_CACHE_DURATION) {
+      ath = athCache[code].value;
+    } else {
+      ath = Math.max(KNOWN_ATH[code] || 0, kr.high52, kr.currentPrice);
+      athCache[code] = { value: ath, timestamp: now };
+      setCache(ATH_CACHE_KEY, athCache);
+    }
+
+    if (kr.currentPrice > ath) {
+      ath = kr.currentPrice;
+      athCache[code] = { value: ath, timestamp: now };
+      setCache(ATH_CACHE_KEY, athCache);
+    }
+
+    const drawdown = ((kr.currentPrice - ath) / ath) * 100;
+    const dayChange = ((kr.currentPrice - kr.prevClose) / kr.prevClose) * 100;
+
+    return { ticker: code, currentPrice: kr.currentPrice, ath, drawdown, dayChange, currency: 'KRW' };
+  } catch (e) {
+    console.error(`${code} 에러:`, e);
+    return { ticker: code, error: true, errorMsg: e.message };
+  }
+}
 
 async function fetchStockSmart(ticker) {
   const athCache = getCache(ATH_CACHE_KEY) || {};
@@ -354,7 +450,8 @@ async function fetchStockSmart(ticker) {
       currentPrice: quote.currentPrice,
       ath,
       drawdown,
-      dayChange
+      dayChange,
+      currency: 'USD'
     };
   } catch (e) {
     console.error(`${ticker} 에러:`, e);
@@ -403,7 +500,11 @@ function renderCard(stock, data, isDark, isUpdating = false) {
     const ddStyle = isDark ? getDrawdownStyleDark(data.drawdown) : getDrawdownStyle(data.drawdown);
     const dayClass = data.dayChange >= 0 ? 'green' : 'red';
     const daySign = data.dayChange >= 0 ? '+' : '';
-    
+
+    const isKrw = data.currency === 'KRW';
+    const priceStr = isKrw ? `₩${fmt(data.currentPrice, 0)}` : `$${fmt(data.currentPrice)}`;
+    const athStr = isKrw ? `₩${fmt(data.ath, 0)}` : `$${fmt(data.ath)}`;
+
     card.innerHTML = `
       <div class="card-top">
         <div>
@@ -417,11 +518,11 @@ function renderCard(stock, data, isDark, isUpdating = false) {
       <div class="stats stat-divider">
         <div>
           <div class="stat-label">현재가</div>
-          <div class="stat-value">$${fmt(data.currentPrice)}</div>
+          <div class="stat-value">${priceStr}</div>
         </div>
         <div>
           <div class="stat-label">전고점</div>
-          <div class="stat-value">$${fmt(data.ath)}</div>
+          <div class="stat-value">${athStr}</div>
         </div>
         <div>
           <div class="stat-label">일간</div>
@@ -489,7 +590,9 @@ async function loadAll(forceRefresh = false) {
     }
   }
   
-  const results = await Promise.all(STOCKS.map(s => fetchStockSmart(s.ticker)));
+  const results = await Promise.all(STOCKS.map(s =>
+    s.market === 'kr' ? fetchStockSmartKr(s) : fetchStockSmart(s.ticker)
+  ));
   
   if (results.some(r => !r.error)) {
     setCache(CACHE_KEY, { results, timestamp: Date.now() });
