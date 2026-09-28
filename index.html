@@ -230,10 +230,12 @@
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
     <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
   </div>
   
   <div class="info-box">
     💡 Finnhub API 사용 (분당 60회 무료). 가격은 약 15분 지연될 수 있습니다.
+    <br>🪙 코인 시세는 Coinbase 기준이며, 일간 변동은 24시간 기준입니다.
     <br>📊 데이터 로드 후 하락률이 큰 순서대로 자동 정렬됩니다.
     <br><br>
     📱 홈 화면에 추가: 공유 → "홈 화면에 추가"
@@ -250,10 +252,11 @@ const API_KEY = "d7ulle9r01qnv95o2khgd7ulle9r01qnv95o2ki0";
 
 
 // 알파벳 순서로 정렬 (티커 기준)
-// market: 'us'(미국, Finnhub) 또는 'kr'(한국, 네이버금융)
+// market: 'us'(미국, Finnhub), 'kr'(한국, 네이버금융), 'crypto'(코인, Coinbase)
 const STOCKS = [
   { ticker: 'COIN',   name: 'Coinbase',     desc: '크립토 거래소',  category: '코인', market: 'us' },
   { ticker: 'CRCL',   name: 'Circle',       desc: 'USDC 발행사',    category: '코인', market: 'us' },
+  { ticker: 'FIL',    name: 'Filecoin',     desc: '탈중앙 스토리지 코인', category: '코인', market: 'crypto', product: 'FIL-USD' },
   { ticker: 'GOOGL',  name: 'Alphabet',     desc: '구글 모회사',    category: 'AI',   market: 'us' },
   { ticker: 'IONQ',   name: 'IonQ',         desc: '양자컴퓨팅',     category: 'AI',   market: 'us' },
   { ticker: 'JOBY',   name: 'Joby',         desc: 'eVTOL/도심항공', category: '모빌리티', market: 'us' },
@@ -266,8 +269,8 @@ const STOCKS = [
   { ticker: '376900', name: '로킷헬스케어', desc: '재생치료 의료기기', category: '헬스케어', market: 'kr' }
 ];
 
-const CACHE_KEY = 'stock_tracker_cache_v6';
-const ATH_CACHE_KEY = 'stock_tracker_ath_v6';
+const CACHE_KEY = 'stock_tracker_cache_v7';
+const ATH_CACHE_KEY = 'stock_tracker_ath_v7';
 const CACHE_DURATION = 5 * 60 * 1000;
 const ATH_CACHE_DURATION = 24 * 60 * 60 * 1000;
 
@@ -321,6 +324,7 @@ function setCache(key, data) {
 const KNOWN_ATH = {
   'COIN':  444.65,    // 2025-07
   'CRCL':  298.99,    // 2025-06
+  'FIL':   236.84,    // 2021-04-01
   'GOOGL': 399.01,    // 2026-05-05
   'IONQ':  84.64,
   'JOBY':  20.95,     // 2025-08-04
@@ -419,6 +423,54 @@ async function fetchStockSmartKr(stock) {
   } catch (e) {
     console.error(`${code} 에러:`, e);
     return { ticker: code, error: true, errorMsg: e.message };
+  }
+}
+
+// 코인 현재가 + 24시간 시가/고가 (Coinbase 공개 API, 키 불필요)
+async function fetchCrypto(product) {
+  const url = `https://api.exchange.coinbase.com/products/${product}/stats`;
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const last = parseFloat(data.last);
+  if (!last) throw new Error('no price');
+  return {
+    currentPrice: last,
+    prevClose: parseFloat(data.open) || last,
+    high24h: parseFloat(data.high) || last
+  };
+}
+
+async function fetchStockSmartCrypto(stock) {
+  const ticker = stock.ticker;
+  const athCache = getCache(ATH_CACHE_KEY) || {};
+  const now = Date.now();
+
+  try {
+    const c = await fetchCrypto(stock.product);
+
+    let ath;
+    if (athCache[ticker] && (now - athCache[ticker].timestamp) < ATH_CACHE_DURATION) {
+      ath = athCache[ticker].value;
+    } else {
+      ath = Math.max(KNOWN_ATH[ticker] || 0, c.high24h, c.currentPrice);
+      athCache[ticker] = { value: ath, timestamp: now };
+      setCache(ATH_CACHE_KEY, athCache);
+    }
+
+    if (c.currentPrice > ath) {
+      ath = c.currentPrice;
+      athCache[ticker] = { value: ath, timestamp: now };
+      setCache(ATH_CACHE_KEY, athCache);
+    }
+
+    const drawdown = ((c.currentPrice - ath) / ath) * 100;
+    const dayChange = ((c.currentPrice - c.prevClose) / c.prevClose) * 100;
+
+    return { ticker, currentPrice: c.currentPrice, ath, drawdown, dayChange, currency: 'USD' };
+  } catch (e) {
+    console.error(`${ticker} 에러:`, e);
+    return { ticker, error: true, errorMsg: e.message };
   }
 }
 
@@ -601,7 +653,9 @@ async function loadAll(forceRefresh = false) {
   }
   
   const results = await Promise.all(STOCKS.map(s =>
-    s.market === 'kr' ? fetchStockSmartKr(s) : fetchStockSmart(s.ticker)
+    s.market === 'kr' ? fetchStockSmartKr(s)
+      : s.market === 'crypto' ? fetchStockSmartCrypto(s)
+      : fetchStockSmart(s.ticker)
   ));
   
   if (results.some(r => !r.error)) {
